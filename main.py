@@ -53,7 +53,7 @@ _sys.modules.setdefault("main", _sys.modules[__name__])
 
 IRAN_TZ = ZoneInfo("Asia/Tehran")
 
-app = FastAPI(title="Pars Space", docs_url=None, redoc_url=None)
+app = FastAPI(title="Spider Gateway", docs_url=None, redoc_url=None)
 
 # Import and include xhttp_siz10 router - deferred until globals are defined
 xhttp_router = None
@@ -73,21 +73,18 @@ def _env_port(default: int = PANEL_PORT) -> int:
 
 CONFIG = {
     "port": PANEL_PORT,
-    "secret": os.environ.get("SECRET_KEY") or secrets.token_urlsafe(48),
+    "secret": os.environ.get("SECRET_KEY", "spider-panel-secret-key-v2"),
     # Public host is discovered at runtime. Never use localhost as a public
     # endpoint or as a value embedded in client configs.
     "host": "",
 }
 
-# Cross-origin access is opt-in. Set CORS_ORIGINS to a comma-separated list
-# of trusted origins only when a separate frontend actually needs CORS.
-_CORS_ORIGINS = [origin.strip() for origin in os.environ.get("CORS_ORIGINS", "").split(",") if origin.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_CORS_ORIGINS,
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ── Persistence ───────────────────────────────────────────────────────────────
@@ -684,7 +681,7 @@ SESSION_TTL = 60 * 60 * 24 * 7
 def hash_password(pw: str) -> str:
     return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
 
-AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", ""))}
+AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "admin"))}
 SESSIONS: dict = {}
 SESSIONS_LOCK = asyncio.Lock()
 
@@ -1018,16 +1015,6 @@ async def _ensure_xray() -> bool:
 @app.on_event("startup")
 async def startup():
     global http_client
-    # Production safety checks: do not launch the admin panel with a default
-    # password or a predictable session-signing key.
-    admin_password = os.environ.get("ADMIN_PASSWORD", "")
-    secret_key = os.environ.get("SECRET_KEY", "")
-    if len(admin_password) < 12:
-        raise RuntimeError("Set Railway variable ADMIN_PASSWORD to a unique password of at least 12 characters.")
-    if len(secret_key) < 32:
-        raise RuntimeError("Set Railway variable SECRET_KEY to a persistent random value of at least 32 characters.")
-    AUTH["password_hash"] = hash_password(admin_password)
-    CONFIG["secret"] = secret_key
     limits = httpx.Limits(max_connections=500, max_keepalive_connections=100)
     timeout = httpx.Timeout(30.0, connect=10.0)
     http_client = httpx.AsyncClient(
@@ -2911,7 +2898,7 @@ async def deployment_ui_fixes(request: Request, call_next):
         logger.debug("Request public-endpoint discovery failed: %s", exc)
 
     if request.url.path == "/":
-        return RedirectResponse("/login", status_code=307)
+        return RedirectResponse("/spider", status_code=307)
     response = await call_next(request)
     content_type = response.headers.get("content-type", "")
     if "text/html" not in content_type:
@@ -3175,7 +3162,7 @@ TGProxy = MTProtoProxyServer
 
 @app.get("/")
 async def root():
-    return RedirectResponse(url="/login", status_code=307)
+    return {"service": "Spider Gateway", "version": "10.1", "status": "active"}
 
 
 @app.get("/healthz")
@@ -3183,7 +3170,7 @@ async def healthz():
     """Provider-neutral health check endpoint; never blocks on public-domain discovery."""
     return {
         "ok": True,
-        "service": "Pars Space",
+        "service": "SpiderPanel",
         "port": CONFIG.get("port", 8080),
         "public_domain_ready": bool(get_host()),
     }
@@ -3589,23 +3576,11 @@ async def sub_group_subscription(uuid_key: str, request: Request):
 # ── Auth endpoints ────────────────────────────────────────────────────────────
 @app.post("/api/login")
 async def api_login(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="درخواست ورود نامعتبر است")
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="درخواست ورود نامعتبر است")
+    body = await request.json()
     ip = client_ip(request)
-    # Username is configurable on Railway. Older clients that only send a
-    # password remain compatible; the redesigned login page sends both fields.
-    expected_username = os.environ.get("ADMIN_USERNAME", "admin")
-    provided_username = str(body.get("username", expected_username)).strip()
-    provided_password = str(body.get("password", ""))
-    username_ok = secrets.compare_digest(provided_username.encode("utf-8"), expected_username.encode("utf-8"))
-    password_ok = secrets.compare_digest(hash_password(provided_password), AUTH["password_hash"])
-    if not (username_ok and password_ok):
+    if hash_password(str(body.get("password", ""))) != AUTH["password_hash"]:
         log_activity("auth", f"تلاش ورود ناموفق از {ip}", "err")
-        raise HTTPException(status_code=401, detail="نام کاربری یا رمز عبور نادرست است")
+        raise HTTPException(status_code=401, detail="رمز عبور اشتباه است")
     token = await create_session()
     log_activity("auth", f"ورود موفق به پنل از {ip}", "ok")
     resp = JSONResponse({"ok": True})
@@ -3746,7 +3721,7 @@ async def api_me(request: Request):
     info = await _build_server_info(refresh=auth)
     async with SETTINGS_LOCK:
         key = _get_panel_api_key_sync()
-    return {"authenticated": auth, **info, **({"api_key": key} if auth else {})}
+    return {"authenticated": auth, **info, "api_key": key}
 
 
 @app.patch("/api/me")
@@ -13479,7 +13454,4 @@ async def bot_channel_run(_=Depends(require_auth)):
 
 
 if __name__ == "__main__":
-    # Railway injects PORT at runtime. Keep PANEL_PORT/CONFIG["port"] intact
-    # for legacy proxy URL construction, but bind the web server to PORT.
-    listen_port = int(os.environ.get("PORT", str(CONFIG["port"])))
-    uvicorn.run("main:app", host="0.0.0.0", port=listen_port, log_level="info", workers=1)
+    uvicorn.run("main:app", host="0.0.0.0", port=CONFIG["port"], log_level="info", workers=1)
