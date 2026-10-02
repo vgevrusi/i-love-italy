@@ -2562,6 +2562,16 @@ def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr:
                       f"&sni={quote(sni)}&fp={quote(str(fp), safe='')}"
                       f"&pbk={quote(pbk, safe='')}&sid={sid}&spx={quote(spx, safe='')}"
                       f"&type=xhttp{host_q}&path={quote(rpath, safe='')}&mode={xmod}&extra={extra}")
+        # VMess/Trojan can also run over Reality natively in Xray. Keep their
+        # protocol-specific share links instead of silently downgrading to VLESS.
+        if proto in ("vmess", "trojan"):
+            pw = str(user.get("trojan_password") or user.get("password") or config_uuid)
+            if proto == "trojan":
+                q = (f"security=reality&type=tcp&sni={quote(sni)}&fp={quote(str(fp), safe='')}"
+                     f"&pbk={quote(pbk, safe='')}&sid={sid}&spx={quote(spx, safe='')}")
+                return f"trojan://{quote(pw, safe='')}@{host}:{port}?{q}#{remark}"
+            obj = {"v":"2","ps":f"Pars Space - {username}","add":host,"port":int(port or 443),"id":config_uuid,"aid":0,"scy":"auto","net":"tcp","type":"none","tls":"reality","sni":sni,"fp":str(fp),"pbk":pbk,"sid":sid,"spx":spx}
+            return "vmess://" + base64.b64encode(json.dumps(obj,separators=(",",":"),ensure_ascii=False).encode()).decode()
         return f"vless://{config_uuid}@{host}:{port}?{params}{_finalmask_query(inbound)}#{remark}"
 
     # ── TLS (WS default / XHTTP selectable) — served by the FastAPI relay ──
@@ -2797,7 +2807,7 @@ def generate_status_config(user: dict, configs: list) -> str:
     host = panel_domain
     port = "443"
 
-    return f"vless://{config_uuid}@{host}:{port}?{params}{_finalmask_query(inbound)}#{remark}"
+    return f"vless://{config_uuid}@{host}:{port}?{params}#{remark}"
 
 
 
@@ -3427,6 +3437,15 @@ async def _build_subscription_data_by_uuid(config_uuid: str):
         "vless_link": config,
         "config": config,
         "configs": all_configs,
+        "links": [{
+            "label": f"Pars Space - {user.get('username', uid)}" if i == 0 else f"Pars Space - {user.get('username', uid)} #{i+1}",
+            "protocol": str(c).split("://",1)[0] if "://" in str(c) else user.get("protocol", "vless"),
+            "active": is_active,
+            "used_fmt": fmt_bytes(used),
+            "limit_fmt": "∞" if limit == 0 else fmt_bytes(limit),
+            "vless_link": c,
+        } for i, c in enumerate(all_configs[1:] if len(all_configs) > 1 else all_configs) if c],
+        "sub_url": f"https://{SETTINGS.get('domain') or get_host()}/link/{user.get('config_uuid', config_uuid)}",
         "worker_configs": list(user.get("worker_configs") or []),
         "worker_countries": [],
         "inbound_ids": inbound_ids,
@@ -4809,6 +4828,7 @@ async def list_users(_=Depends(require_auth)):
             "config_url": f"https://{host}/api/users/{uid}/config",
             "qr_url": f"https://{host}/api/users/{uid}/qr",
             "subscription_url": f"https://{host}/link/{u.get('config_uuid')}",
+            "subscription_type": "per-user",
             "connections": sum(1 for c in connections.values() if c.get("uuid") == u.get("config_uuid")),
             "node_configs": dict(u.get("node_configs") or {}),
             "node_sync_state": dict(u.get("node_sync_state") or {}),
@@ -5508,6 +5528,7 @@ async def get_user_config(user_id: str, _=Depends(require_auth)):
         "config_url": f"https://{host}/api/users/{user_id}/config",
         "qr_url": f"https://{host}/api/users/{user_id}/qr",
         "subscription_url": f"https://{host}/link/{u.get('config_uuid')}",
+            "subscription_type": "per-user",
     }
 
 @app.get("/api/users/{user_id}/qr")
@@ -5701,7 +5722,18 @@ async def public_sub_data(uuid_key: str, request: Request):
     async with SUBS_LOCK:
         sub_entry = next(((sid, s) for sid, s in SUBS.items() if s.get("uuid_key") == uuid_key), None)
     if not sub_entry:
-        raise HTTPException(status_code=404, detail="not found")
+        # /link/{config_uuid} is also a real per-user subscription. The same
+        # graphical Pars Space page is used for both group and personal links.
+        try:
+            data = await _build_subscription_data_by_uuid(uuid_key)
+            data["name"] = data.get("username") or "Pars Space"
+            data["desc"] = "Personal Pars Space subscription"
+            data["sub_url"] = f"https://{SETTINGS.get('domain') or get_host()}/link/{uuid_key}"
+            data["total_used_fmt"] = data.get("traffic_used_fmt", "0 B")
+            data["active_connections"] = sum(1 for c in connections.values() if c.get("uuid") == uuid_key)
+            return data
+        except HTTPException:
+            raise HTTPException(status_code=404, detail="not found")
     sub_id, sub = sub_entry
 
     has_pw = sub.get("password_hash") is not None
@@ -9450,17 +9482,16 @@ def generate_xray_server_config(inbound_id: str = None) -> dict:
 def _add_inbound_to_xray(cfg: dict, ib: dict, iid: str, host: str):
     """Add a single inbound to an Xray config dict.
 
-    Only REALITY inbounds are served by Xray: WS/XHTTP TLS inbounds are handled
-    by the FastAPI relay (Railway terminates TLS on the public port), and the
-    Worker inbound is handled by the Cloudflare Worker. Adding TLS inbounds with
-    a fake /etc/xray/cert.pem made Xray fail on Railway (no cert file), which
-    took down Reality too.
+    Reality inbounds are served natively by Xray. Native VMess/Trojan inbounds
+    are also emitted when they use Reality security. Plain VMess can be emitted
+    on a dedicated TCP port. Ordinary public TLS VMess/Trojan still requires a
+    real certificate on the Xray host, so the panel never invents certificate paths.
     """
     protocol = ib.get("protocol", "vless")
     security = ib.get("security", "tls")
     is_reality = protocol == "reality" or security == "reality"
-    if not is_reality:
-        return  # WS/XHTTP-TLS + worker inbounds are NOT Xray's job
+    if not is_reality and protocol not in ("vmess", "trojan"):
+        return  # TLS WS/XHTTP + worker inbounds are handled by their relays
     # A reality inbound without a configured port is not ready yet — skip it
     # so Xray doesn't start on a wrong/default port.
     _raw_port = str(ib.get("port") or "").strip()
@@ -9508,12 +9539,13 @@ def _add_inbound_to_xray(cfg: dict, ib: dict, iid: str, host: str):
         clients = []
         for uid in client_ids:
             client = {"id": uid}
+            matched_user = next((uu for uu in USERS.values() if uu.get("config_uuid") == uid), {})
             if protocol in ("vless", "reality"):
                 client["flow"] = ""
             elif protocol == "vmess":
                 client["alterId"] = 0
             elif protocol == "trojan":
-                client["password"] = str(u.get("trojan_password") or u.get("password") or u.get("config_uuid") or uid)
+                client["password"] = str(matched_user.get("trojan_password") or matched_user.get("password") or matched_user.get("config_uuid") or uid)
             clients.append(client)
         inbound_obj["settings"]["clients"] = clients
 
@@ -9574,7 +9606,19 @@ def _add_inbound_to_xray(cfg: dict, ib: dict, iid: str, host: str):
                 "scMaxBufferedPosts": xh_settings.get("scMaxBufferedPosts", 30),
                 "scStreamUpServerSecs": xh_settings.get("scStreamUpServerSecs", "20-80"),
             }
+    elif protocol in ("vmess", "trojan") and security == "none":
+        inbound_obj["streamSettings"] = {"network": network if network in ("tcp", "ws", "grpc") else "tcp", "security": "none"}
+        if network == "ws":
+            inbound_obj["streamSettings"]["wsSettings"] = {"path": ws_settings.get("path", "/"), "headers": {"Host": ws_settings.get("host", domain)}}
+        elif network == "grpc":
+            inbound_obj["streamSettings"]["grpcSettings"] = {"serviceName": grpc_settings.get("serviceName", "pars-space")}
     elif security == "tls":
+        # Native TLS requires certificate files explicitly supplied to Xray.
+        cert_file = os.environ.get("XRAY_CERT_FILE", "/etc/xray/cert.pem")
+        key_file = os.environ.get("XRAY_KEY_FILE", "/etc/xray/key.pem")
+        if not os.path.exists(cert_file) or not os.path.exists(key_file):
+            logger.warning("Skipping native TLS %s inbound %s: certificate files are not present", protocol, iid)
+            return
         inbound_obj["streamSettings"] = {
             "network": network,
             "security": "tls",
