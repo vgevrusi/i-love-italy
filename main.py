@@ -250,6 +250,8 @@ async def load_state():
             SUBS.update(data.get("subs", {}))
             USERS.update(data.get("users", {}))
             # Always load saved password hash (no secret-key guard — causes password reset bugs)
+            if "username" in data and str(data.get("username") or "").strip():
+                AUTH["username"] = str(data.get("username")).strip()
             if "password_hash" in data:
                 AUTH["password_hash"] = data["password_hash"]
             # Also store saved_secret so future saves remain consistent
@@ -434,6 +436,7 @@ async def save_state():
                 "nodes": dict(NODES),
                 "pending_node_deletions": dict(PENDING_NODE_DELETIONS),
                 "bot_orders": dict(BOT_ORDERS),
+                "username": AUTH.get("username", "admin"),
                 "password_hash": AUTH["password_hash"],
                 "saved_secret": CONFIG["secret"],
                 "saved_at": datetime.now().isoformat(),
@@ -681,7 +684,7 @@ SESSION_TTL = 60 * 60 * 24 * 7
 def hash_password(pw: str) -> str:
     return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
 
-AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "admin"))}
+AUTH = {"username": os.environ.get("ADMIN_USERNAME", "admin"), "password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "admin"))}
 SESSIONS: dict = {}
 SESSIONS_LOCK = asyncio.Lock()
 
@@ -2379,6 +2382,50 @@ def generate_short_id() -> str:
     """Generate a shorter ID for user management."""
     return secrets.token_hex(6)
 
+def _generate_protocol_share_link(config_uuid: str, username: str, password: str, proto: str, host: str, port: str, transport: str, security: str, inbound: dict | None, user: dict, addr_ip: str | None = None, addr_port: str | None = None, alpn: str = "http/1.1") -> str:
+    """Generate a client share link matching the selected protocol/transport.
+
+    This deliberately emits VMess/Trojan links instead of pretending every
+    protocol is VLESS. The old implementation did exactly that, which is a
+    particularly creative way to make a protocol selector decorative.
+    """
+    host = addr_ip or host
+    port = addr_port or port
+    remark = quote(f"Pars Space - {username}")
+    fp = str((inbound or {}).get("fingerprint") or "chrome")
+    if transport == "ws":
+        ws = (inbound or {}).get("ws_settings") or {}
+        path = str(ws.get("path") or (inbound or {}).get("path") or f"/ws/{config_uuid}").strip()
+        if not path.startswith("/"): path = "/" + path
+        host_header = str(ws.get("host") or host).strip()
+        if proto == "vmess":
+            obj = {"v":"2","ps":f"Pars Space - {username}","add":host,"port":int(port or 443),"id":config_uuid,"aid":0,"scy":"auto","net":"ws","type":"none","host":host_header,"path":path,"tls":"tls" if security=="tls" else "","sni":host,"alpn":alpn}
+            return "vmess://" + base64.b64encode(json.dumps(obj,separators=(",",":"),ensure_ascii=False).encode()).decode()
+        if proto == "trojan":
+            pw = str(password or user.get("trojan_password") or config_uuid)
+            q = f"security={quote(security)}&type=ws&host={quote(host_header)}&path={quote(path,safe='')}&sni={quote(host)}&fp={quote(fp)}&alpn={quote(alpn)}"
+            return f"trojan://{quote(pw,safe='')}@{host}:{port}?{q}#{remark}"
+    elif transport == "grpc":
+        gs = (inbound or {}).get("grpc_settings") or {}
+        service = str(gs.get("serviceName") or gs.get("service_name") or "pars-space").strip()
+        if proto == "vmess":
+            obj = {"v":"2","ps":f"Pars Space - {username}","add":host,"port":int(port or 443),"id":config_uuid,"aid":0,"scy":"auto","net":"grpc","type":"none","host":host,"path":service,"tls":"tls" if security=="tls" else "","sni":host,"alpn":alpn}
+            return "vmess://" + base64.b64encode(json.dumps(obj,separators=(",",":"),ensure_ascii=False).encode()).decode()
+        if proto == "trojan":
+            pw = str(password or user.get("trojan_password") or config_uuid)
+            q = f"security={quote(security)}&type=grpc&serviceName={quote(service)}&sni={quote(host)}&fp={quote(fp)}&alpn={quote(alpn)}"
+            return f"trojan://{quote(pw,safe='')}@{host}:{port}?{q}#{remark}"
+    elif transport == "tcp":
+        if proto == "vmess":
+            obj = {"v":"2","ps":f"Pars Space - {username}","add":host,"port":int(port or 443),"id":config_uuid,"aid":0,"scy":"auto","net":"tcp","type":"none","host":"","path":"","tls":"tls" if security=="tls" else "","sni":host,"alpn":alpn}
+            return "vmess://" + base64.b64encode(json.dumps(obj,separators=(",",":"),ensure_ascii=False).encode()).decode()
+        if proto == "trojan":
+            pw = str(password or user.get("trojan_password") or config_uuid)
+            q = f"security={quote(security)}&type=tcp&sni={quote(host)}&fp={quote(fp)}&alpn={quote(alpn)}"
+            return f"trojan://{quote(pw,safe='')}@{host}:{port}?{q}#{remark}"
+    # Fallback for protocols not covered above.
+    return ""
+
 def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr: str = None, remark_tag: str = None) -> str:
     """Build a VLESS config string for one inbound of a user.
 
@@ -2399,6 +2446,8 @@ def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr:
     proto = proto.lower()
     sec = (inbound.get("security") if inbound else None) or "tls"
     sec = sec.lower()
+    tls_cfg = (inbound.get("tls_settings") or {}) if inbound else {}
+    alpn = str(tls_cfg.get("alpn") or "http/1.1").strip() or "http/1.1"
 
     config_uuid = str(user.get("config_uuid", "") or user_id).strip()
     if not _is_valid_uuid(config_uuid):
@@ -2481,7 +2530,7 @@ def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr:
         # xhttp (default for reality inbound) or tcp
         if (inbound.get("network") or "xhttp") == "tcp":
             params = (f"encryption=none&security=reality&type=tcp"
-                      f"&sni={quote(sni)}&fp={fp}&alpn=h2,http/1.1"
+                      f"&sni={quote(sni)}&fp={fp}&alpn={quote(alpn)}"
                       f"&pbk={pbk}&sid={sid}&spx={spx}")
         else:
             xpb = xs.get("xPaddingBytes", "100-1000")
@@ -2521,7 +2570,7 @@ def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr:
             rpath = f"/reverse/{config_uuid}"
             params = ("encryption=none&security=tls&type=ws"
                       f"&host={quote(wdom)}&path={quote(rpath, safe='')}&sni={quote(wdom)}"
-                      "&fp=chrome&alpn=http/1.1")
+                      f"&fp=chrome&alpn={quote(alpn)}")
             rev_rem = quote(f"Spider-{username} Reverse".strip())
             return f"vless://{config_uuid}@{wdom}:443?{params}#{rev_rem}"
         # Plain tunnel: user → Railway → Worker → site (path /tunnel/{uuid},
@@ -2529,7 +2578,7 @@ def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr:
         tpath = f"/tunnel/{config_uuid}"
         params = ("encryption=none&security=tls&type=ws"
                   f"&host={quote(panel_domain)}&path={quote(tpath, safe='')}&sni={quote(panel_domain)}"
-                  "&fp=chrome&alpn=http/1.1")
+                  f"&fp=chrome&alpn={quote(alpn)}")
         tun_rem = quote(f"Spider-{username} Tunnel".strip())
         return f"vless://{config_uuid}@{panel_domain}:443?{params}#{tun_rem}"
 
@@ -2567,16 +2616,16 @@ def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr:
         xpath = f"/xhttp-siz10/{xmode}/{config_uuid}"
         params = (f"encryption=none&security={security}&type=xhttp"
                   f"&host={quote(host)}&path={quote(xpath, safe='')}&sni={quote(host)}"
-                  f"&fp=chrome&alpn=h2,http/1.1&mode={xmode}&extra={extra}")
+                  f"&fp=chrome&alpn={quote(alpn)}&mode={xmode}&extra={extra}")
     elif transport == "grpc":
         gs = (inbound.get("grpc_settings") or {}) if inbound else {}
         service = str(gs.get("serviceName") or gs.get("service_name") or "spider").strip() or "spider"
         params = (f"encryption=none&security={security}&type=grpc"
                   f"&serviceName={quote(service)}&sni={quote(host)}"
-                  f"&fp=chrome&alpn=h2,http/1.1")
+                  f"&fp=chrome&alpn={quote(alpn)}")
     elif transport == "tcp":
         params = (f"encryption=none&security={security}&type=tcp"
-                  f"&sni={quote(host)}&fp=chrome&alpn=h2,http/1.1")
+                  f"&sni={quote(host)}&fp=chrome&alpn={quote(alpn)}")
     else:  # ws
         # Only the exact default TLS+WS inbound may use /ws/{uuid}; other WS
         # inbounds keep their own configured path if present.
@@ -2587,7 +2636,14 @@ def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr:
             ws_path = configured_path if configured_path.startswith("/") else f"/{configured_path}"
         params = (f"encryption=none&security={security}&type=ws"
                   f"&host={quote(host)}&path={quote(ws_path, safe='')}&sni={quote(host)}"
-                  f"&fp=chrome&alpn=http/1.1")
+                  f"&fp=chrome&alpn={quote(alpn)}")
+    if proto in ("vmess", "trojan"):
+        generated = _generate_protocol_share_link(
+            config_uuid, username, str(user.get("password") or user.get("trojan_password") or ""),
+            proto, host, port, transport, security, inbound, user, addr_ip, addr_port, alpn
+        )
+        if generated:
+            return generated
     return f"vless://{config_uuid}@{host}:{port}?{params}#{remark}"
 
 
@@ -3556,11 +3612,21 @@ async def sub_group_subscription(uuid_key: str, request: Request):
     host = SETTINGS.get("domain") or get_host()
     link_ids = sub.get("link_ids", [])
     async with LINKS_LOCK:
-        lines = []
-        for lid in link_ids:
-            link = LINKS.get(lid)
-            if link and is_link_allowed(link):
-                lines.append(generate_vless_link(lid, host, remark=f"Spider-{link['label']}", protocol=link.get("protocol", DEFAULT_PROTOCOL)))
+        snap_links = dict(LINKS)
+    async with USERS_LOCK:
+        snap_users = dict(USERS)
+    lines = []
+    for lid in link_ids:
+        link = snap_links.get(lid)
+        if not link or not is_link_allowed(link):
+            continue
+        uid = link.get("user_id")
+        user = snap_users.get(uid) if uid else None
+        cfg = generate_user_config(uid, user, link.get("inbound_id") or user.get("inbound_id")) if uid and user else ""
+        if not cfg:
+            cfg = generate_vless_link(lid, host, remark=f"Pars-{link.get('label','user')}", protocol=link.get('protocol', DEFAULT_PROTOCOL))
+        if cfg:
+            lines.append(cfg)
 
     content = base64.b64encode("\n".join(lines).encode()).decode()
     return Response(
@@ -3578,9 +3644,10 @@ async def sub_group_subscription(uuid_key: str, request: Request):
 async def api_login(request: Request):
     body = await request.json()
     ip = client_ip(request)
-    if hash_password(str(body.get("password", ""))) != AUTH["password_hash"]:
+    username = str(body.get("username", "")).strip()
+    if username != str(AUTH.get("username") or "admin") or hash_password(str(body.get("password", ""))) != AUTH["password_hash"]:
         log_activity("auth", f"تلاش ورود ناموفق از {ip}", "err")
-        raise HTTPException(status_code=401, detail="رمز عبور اشتباه است")
+        raise HTTPException(status_code=401, detail="نام کاربری یا رمز عبور اشتباه است")
     token = await create_session()
     log_activity("auth", f"ورود موفق به پنل از {ip}", "ok")
     resp = JSONResponse({"ok": True})
@@ -3721,7 +3788,7 @@ async def api_me(request: Request):
     info = await _build_server_info(refresh=auth)
     async with SETTINGS_LOCK:
         key = _get_panel_api_key_sync()
-    return {"authenticated": auth, **info, "api_key": key}
+    return {"authenticated": auth, "username": AUTH.get("username", "admin"), **info, "api_key": key}
 
 
 @app.patch("/api/me")
@@ -3759,6 +3826,26 @@ async def api_change_password(request: Request, token=Depends(require_auth)):
     await save_state()
     log_activity("auth", "رمز عبور پنل تغییر کرد", "ok")
     return {"ok": True}
+
+@app.post("/api/change-credentials")
+async def api_change_credentials(request: Request, token=Depends(require_auth)):
+    body = await request.json()
+    current = str(body.get("current_password") or "")
+    if hash_password(current) != AUTH["password_hash"]:
+        raise HTTPException(status_code=400, detail="رمز فعلی اشتباه است")
+    username = str(body.get("username") or AUTH.get("username") or "admin").strip()
+    if not re.fullmatch(r"(?=(?:.*[A-Za-z]){2,})[A-Za-z0-9_-]+", username):
+        raise HTTPException(status_code=400, detail="نام کاربری باید حداقل دو حرف انگلیسی و فقط شامل A-Z، 0-9، _ یا - باشد")
+    new = str(body.get("new_password") or "")
+    if len(new) < 4:
+        raise HTTPException(status_code=400, detail="رمز جدید باید حداقل ۴ کاراکتر باشد")
+    AUTH["username"] = username
+    AUTH["password_hash"] = hash_password(new)
+    async with SESSIONS_LOCK:
+        SESSIONS.clear()
+        SESSIONS[token] = time.time() + SESSION_TTL
+    await save_state()
+    return {"ok":True,"username":username}
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
 @app.get("/stats")
@@ -4261,6 +4348,7 @@ async def create_inbound(request: Request, auth=Depends(require_replication_auth
     ws_settings = body.get("ws_settings", {}) if isinstance(body.get("ws_settings"), dict) else {}
     grpc_settings = body.get("grpc_settings", {}) if isinstance(body.get("grpc_settings"), dict) else {}
     telegram_settings = body.get("telegram_settings", {}) if isinstance(body.get("telegram_settings"), dict) else {}
+    tls_settings = body.get("tls_settings", {}) if isinstance(body.get("tls_settings"), dict) else {}
     if protocol == "telegram":
         # Telegram Proxy does not use Xray Reality fields.
         sni = ""
@@ -4301,8 +4389,10 @@ async def create_inbound(request: Request, auth=Depends(require_replication_auth
         if _pub:
             reality_settings["public_key"] = _pub
         reality_settings.setdefault("spiderx", "/")
-        reality_settings.setdefault("mldsa65_seed", fresh["mldsa65_seed"])
-        reality_settings.setdefault("mldsa65_verify", fresh["mldsa65_verify"])
+        if fresh.get("mldsa65_seed"):
+            reality_settings.setdefault("mldsa65_seed", fresh["mldsa65_seed"])
+        if fresh.get("mldsa65_verify"):
+            reality_settings.setdefault("mldsa65_verify", fresh["mldsa65_verify"])
         # SNI from frontend is used as dest, server_names, and sni
         if not reality_settings.get("dest"):
             reality_settings["dest"] = (sni or "is1-ssl.mzstatic.com") + ":443"
@@ -4353,6 +4443,7 @@ async def create_inbound(request: Request, auth=Depends(require_replication_auth
             "ws_settings": ws_settings,
             "grpc_settings": grpc_settings,
             "telegram_settings": telegram_settings,
+            "tls_settings": tls_settings,
             "node_ids": [str(x).strip() for x in (body.get("node_ids") or []) if str(x).strip()],
             "enabled_node_ids": [str(x).strip() for x in (body.get("enabled_node_ids") or body.get("node_ids") or []) if str(x).strip()],
             "created_at": datetime.now().isoformat(),
@@ -4846,6 +4937,7 @@ async def create_user(request: Request, auth=Depends(require_replication_auth)):
     traffic_limit_gb = float(body.get("traffic_limit_gb") or 0)
     expire_days = int(body.get("expire_days") or 0)
     protocol = str(body.get("protocol") or "vless").lower()
+    trojan_password = str(body.get("trojan_password") or (password if protocol == "trojan" else ""))
     _cc_raw = body.get("concurrent_connections")
     concurrent_connections = int(_cc_raw) if _cc_raw is not None else 0
     server = (body.get("server") or "IR-Tehran-01").strip()[:40]
@@ -4998,6 +5090,7 @@ async def create_user(request: Request, auth=Depends(require_replication_auth)):
             "server": server,
             "config_uuid": config_uuid,
             "subscription_uuid": subscription_uuid,
+            "trojan_password": trojan_password,
             "sni": sni,
             "proxy_ip": proxy_ip,
             "proxy_ips": proxy_ips,
@@ -5492,6 +5585,8 @@ async def public_sub_data(uuid_key: str, request: Request):
     link_ids = sub.get("link_ids", [])
     async with LINKS_LOCK:
         snap = dict(LINKS)
+    async with USERS_LOCK:
+        snap_users = dict(USERS)
 
     links_out = []
     active_conns = 0
@@ -5513,7 +5608,7 @@ async def public_sub_data(uuid_key: str, request: Request):
             "limit_bytes": link.get("limit_bytes", 0),
             "limit_fmt": "∞" if link.get("limit_bytes", 0) == 0 else fmt_bytes(link["limit_bytes"]),
             "expires_at": link.get("expires_at"),
-            "vless_link": generate_vless_link(lid, host, remark=f"Spider-{link['label']}", protocol=proto),
+            "vless_link": (generate_user_config(link.get("user_id"), snap_users.get(link.get("user_id"), {}), link.get("inbound_id")) if link.get("user_id") and snap_users.get(link.get("user_id")) else generate_vless_link(lid, host, remark=f"Pars-{link['label']}", protocol=proto)),
             "sub_url": f"https://{host}/link/{lid}",
             "connections": conn_count,
         })
@@ -5528,6 +5623,139 @@ async def public_sub_data(uuid_key: str, request: Request):
         "total_used_fmt": fmt_bytes(total_used),
         "links": links_out,
     }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PARS SPACE API v1
+# Thin public contract over the existing local data model. The dashboard uses
+# this namespace only, so its frontend no longer depends on Spider-named routes.
+# ══════════════════════════════════════════════════════════════════════════════
+PARS_API_KEY = str(SETTINGS.get("pars_api_key") or "").strip()
+if not PARS_API_KEY.startswith("psp_"):
+    PARS_API_KEY = "psp_" + secrets.token_urlsafe(24)
+    SETTINGS["pars_api_key"] = PARS_API_KEY
+    SETTINGS.setdefault("pars_panel_id", "pars_" + secrets.token_hex(6))
+
+async def _pars_v1_auth(request: Request):
+    key = str(request.headers.get("x-pars-key") or "").strip()
+    authz = str(request.headers.get("authorization") or "")
+    if authz.lower().startswith("bearer "):
+        key = authz[7:].strip()
+    if key and secrets.compare_digest(key, str(SETTINGS.get("pars_api_key") or PARS_API_KEY)):
+        return {"kind":"api_key"}
+    if await is_valid_session(request.cookies.get(SESSION_COOKIE)):
+        return {"kind":"session"}
+    raise HTTPException(status_code=401, detail="Pars API authentication required")
+
+def _pars_host():
+    return SETTINGS.get("domain") or get_host()
+
+@app.get("/api/pars/v1/identity")
+async def pars_identity(request: Request):
+    await _pars_v1_auth(request)
+    return {"panel_id": SETTINGS.get("pars_panel_id") or "pars-local", "name":"Pars Space", "version":"1.0"}
+
+@app.get("/api/pars/v1/health")
+async def pars_health(request: Request):
+    await _pars_v1_auth(request)
+    return {"ok":True,"status":"online","host":_pars_host(),"uptime":uptime()}
+
+@app.get("/api/pars/v1/stats")
+async def pars_stats(request: Request):
+    await _pars_v1_auth(request)
+    async with USERS_LOCK: users=list(USERS.values())
+    async with INBOUNDS_LOCK: ibs=list(INBOUNDS.values())
+    async with LINKS_LOCK: links=list(LINKS.values())
+    return {"active_users":sum(1 for u in users if is_user_allowed(u)),"connections":len(connections),"inbounds":len(ibs),"total_traffic":sum(int(u.get("traffic_used_bytes") or 0) for u in users),"total_traffic_fmt":fmt_bytes(sum(int(u.get("traffic_used_bytes") or 0) for u in users)),"subscriptions":len(links)}
+
+@app.get("/api/pars/v1/users")
+async def pars_users(request: Request):
+    await _pars_v1_auth(request)
+    return await list_users()
+
+@app.post("/api/pars/v1/users")
+async def pars_create_user(request: Request):
+    await _pars_v1_auth(request)
+    return await create_user(request, {"kind":"session"})
+
+@app.get("/api/pars/v1/inbounds")
+async def pars_inbounds(request: Request):
+    await _pars_v1_auth(request)
+    return await list_inbounds({"kind":"session"})
+
+@app.post("/api/pars/v1/inbounds")
+async def pars_create_inbound(request: Request):
+    await _pars_v1_auth(request)
+    return await create_inbound(request, {"kind":"session"})
+
+@app.get("/api/pars/v1/subscriptions")
+async def pars_subscriptions(request: Request):
+    await _pars_v1_auth(request)
+    return await list_subs()
+
+@app.post("/api/pars/v1/subscriptions")
+async def pars_create_subscription(request: Request):
+    await _pars_v1_auth(request)
+    return await create_sub(request, {"kind":"session"})
+
+@app.get("/api/pars/v1/activity")
+async def pars_activity(request: Request):
+    await _pars_v1_auth(request)
+    rows = list(error_logs)[-50:]
+    return {"activity":[{"message":str(x.get("message") or x.get("error") or x),"created_at":x.get("time") or x.get("created_at") or ""} for x in reversed(rows)]}
+
+@app.get("/api/pars/v1/nodes")
+async def pars_nodes(request: Request):
+    await _pars_v1_auth(request)
+    return await list_nodes()
+
+@app.post("/api/pars/v1/nodes/connect")
+async def pars_connect_node(request: Request):
+    await _pars_v1_auth(request)
+    body=await request.json()
+    # The current remote-node contract remains compatible with existing panels.
+    return await add_node_from_pars(body)
+
+async def add_node_from_pars(body: dict):
+    payload = dict(body)
+    payload["api_key"] = payload.get("api_key") or payload.get("pars_api_key")
+    # Existing node storage currently uses spdr_ credentials. Accept psp_ at the
+    # Pars Space boundary and keep a local compatibility credential internally.
+    key = str(payload.get("api_key") or "")
+    if key.startswith("psp_"):
+        payload["api_key"] = "spdr_" + secrets.token_urlsafe(24)
+    class _Req:
+        async def json(self): return payload
+    return await add_node(_Req(), None)
+
+@app.post("/api/pars/v1/nodes/{node_id}/ping")
+async def pars_node_ping(node_id: str, request: Request):
+    await _pars_v1_auth(request)
+    return await node_health(node_id)
+
+@app.post("/api/pars/v1/nodes/{node_id}/sync")
+async def pars_node_sync(node_id: str, request: Request):
+    await _pars_v1_auth(request)
+    # Reuse the existing full-node refresh/sync reconciliation.
+    result = await refresh_node(node_id)
+    return {"ok":True,"sent":0,"total":0,"node":result.get("node",{})}
+
+@app.delete("/api/pars/v1/nodes/{node_id}")
+async def pars_node_delete(node_id: str, request: Request):
+    await _pars_v1_auth(request)
+    return await delete_node(node_id)
+
+@app.get("/api/pars/v1/credentials")
+async def pars_credentials(request: Request):
+    await _pars_v1_auth(request)
+    return {"api_key":SETTINGS.get("pars_api_key") or PARS_API_KEY,"panel_id":SETTINGS.get("pars_panel_id")}
+
+@app.post("/api/pars/v1/credentials/regenerate")
+async def pars_regenerate_credentials(request: Request):
+    await _pars_v1_auth(request)
+    new_key="psp_"+secrets.token_urlsafe(24)
+    SETTINGS["pars_api_key"]=new_key
+    await save_state()
+    return {"api_key":new_key,"panel_id":SETTINGS.get("pars_panel_id")}
 
 # ── HTML Pages (SPA) ───────────────────────────────────────────────────────
 import os as _os
@@ -5843,6 +6071,7 @@ def _build_backup_payload() -> dict:
             "nodes": dict(NODES),
             "pending_node_deletions": dict(PENDING_NODE_DELETIONS),
             "bot_orders": dict(BOT_ORDERS),
+            "username": AUTH.get("username", "admin"),
             "password_hash": AUTH.get("password_hash", ""),
             "saved_secret": CONFIG.get("secret", ""),
         },
@@ -9155,7 +9384,7 @@ def _add_inbound_to_xray(cfg: dict, ib: dict, iid: str, host: str):
             elif protocol == "vmess":
                 client["alterId"] = 0
             elif protocol == "trojan":
-                client["password"] = secrets.token_urlsafe(16)
+                client["password"] = str(u.get("trojan_password") or u.get("password") or u.get("config_uuid") or uid)
             clients.append(client)
         inbound_obj["settings"]["clients"] = clients
 
