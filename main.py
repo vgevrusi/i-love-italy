@@ -2085,6 +2085,34 @@ def _safe_host(*candidates: str) -> str:
     return get_host()
 
 
+def _is_ip_address(value: str) -> bool:
+    try:
+        import ipaddress
+        ipaddress.ip_address(str(value or '').strip())
+        return True
+    except Exception:
+        return False
+
+
+def _client_public_domain() -> str:
+    """Return a hostname suitable for client configs, never a literal IP.
+
+    The panel may know its public IP for diagnostics, but connection profiles
+    should use the operator's configured/public hostname. If no hostname exists
+    yet, fail closed instead of leaking the panel IP into a share link.
+    """
+    candidates = [
+        SETTINGS.get("domain"),
+        os.environ.get("SPIDER_PANEL_PUBLIC_DOMAIN"),
+        os.environ.get("SPIDER_PANEL_PUBLIC_URL"),
+    ]
+    for raw in candidates:
+        ep = _normalize_public_endpoint(str(raw or ""))
+        if ep and not _is_ip_address(ep.get("host", "")):
+            return ep["host"]
+    return ""
+
+
 DEFAULT_TLS_WS_INBOUND_NAME = "پیش‌فرض TLS + WS"
 LEGACY_TLS_WS_NAMES = {"VLESS+WS پیش‌فرض", "VLESS + WS پیش‌فرض", "پیش‌فرض VLESS+WS", "پیش‌فرض VLESS + WS"}
 
@@ -2471,7 +2499,7 @@ def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr:
 
     # Never generate a client-facing config until a real public hostname is known.
     # Returning an empty config lets the caller/UI retry while the resolver works.
-    panel_domain = _safe_host(SETTINGS.get("domain"), get_host())
+    panel_domain = _client_public_domain()
     if not panel_domain and proto not in ("worker", "reality", "telegram"):
         return ""
 
@@ -2537,6 +2565,8 @@ def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr:
             rpath = "/"
         host = addr_ip or ext_domain
         port = addr_port or ext_port
+        if not host or _is_ip_address(host):
+            return ""
         # xhttp (default for reality inbound) or tcp
         if (inbound.get("network") or "xhttp") == "tcp":
             params = (f"encryption=none&security=reality&type=tcp"
@@ -2576,7 +2606,7 @@ def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr:
 
     # ── TLS (WS default / XHTTP selectable) — served by the FastAPI relay ──
     # address/host/sni always = the panel main domain; port 443 (Railway TLS).
-    panel_domain = _safe_host(SETTINGS.get("domain"), get_host())
+    panel_domain = _client_public_domain()
 
     # ── TUNNEL (user → Railway → CF Worker → site) — path /tunnel/{uuid} ──
     if proto == "tunnel":
@@ -2605,14 +2635,16 @@ def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr:
     # The exact default TLS+WS inbound is the only inbound served by the FastAPI
     # WebSocket relay. Other inbounds must use their own stored transport/domain/port.
     if is_default_tls_ws_inbound(inbound):
-        panel_domain = _safe_host(SETTINGS.get("domain"), get_host())
+        panel_domain = _client_public_domain()
         host = addr_ip or panel_domain
         port = addr_port or "443"
         transport = "ws"
         security = "tls"
     else:
         inbound_domain = str((inbound or {}).get("external_domain") or (inbound or {}).get("domain") or "").strip()
-        host = addr_ip or _safe_host(inbound_domain, SETTINGS.get("domain"), get_host())
+        host = addr_ip or _client_public_domain() or inbound_domain
+        if not host or (_is_ip_address(host) and not addr_ip):
+            return ""
         port = addr_port or str((inbound or {}).get("external_port") or (inbound or {}).get("port") or 443)
         network = str((inbound or {}).get("network") or "").strip().lower()
         # Use the selected inbound's transport first. The user's global transport_type
@@ -2744,7 +2776,7 @@ def generate_status_config(user: dict, configs: list) -> str:
     config_uuid = user.get("config_uuid", "") or user_id
 
     # Use panel domain from discovery (required for TLS WS/XHTTP).
-    panel_domain = _safe_host(SETTINGS.get("domain"), get_host())
+    panel_domain = _client_public_domain()
     if not panel_domain:
         return ""
 
@@ -6147,6 +6179,7 @@ async def set_global_settings(request: Request, _=Depends(require_auth)):
 @app.get("/api/settings")
 async def get_settings(_=Depends(require_auth)):
     """Return all settings, masking the security token."""
+    SETTINGS.setdefault("panel_alias", "Pars Space")
     async with SETTINGS_LOCK:
         s = dict(SETTINGS)
         masked = _get_panel_api_key_sync()
@@ -6163,7 +6196,7 @@ async def update_settings(request: Request, _=Depends(require_auth)):
     allowed_keys = {
         "websocket_mode", "xhttp_mode", "default_connection_mode",
         "max_ip_per_user", "bandwidth_limit_mbps", "live_monitoring",
-        "auto_ip_rotation", "server_ip", "country", "country_code", "country_flag",
+        "auto_ip_rotation", "server_ip", "country", "country_code", "country_flag", "panel_alias",
     }
     async with SETTINGS_LOCK:
         for k, v in body.items():
@@ -9509,14 +9542,18 @@ def _add_inbound_to_xray(cfg: dict, ib: dict, iid: str, host: str):
     xh_settings = ib.get("xhttp_settings", {})
     grpc_settings = ib.get("grpc_settings", {})
     
+    xray_protocol = "vless" if protocol == "reality" else protocol
+    inbound_settings = {"clients": []}
+    if xray_protocol == "vless":
+        inbound_settings["decryption"] = "none"
     inbound_obj = {
         "tag": f"inbound-{iid}",
         "listen": "0.0.0.0",
         "port": port,
-        # Xray has no "reality" protocol id — Reality is a security layer on top
-        # of VLESS, so reality inbounds must declare protocol "vless".
-        "protocol": "vless" if protocol == "reality" else protocol,
-        "settings": {"clients": [], "decryption": "none"},
+        # Reality is a security layer. A Reality inbound declared as protocol
+        # `reality` is invalid in Xray, so only that case maps to VLESS.
+        "protocol": xray_protocol,
+        "settings": inbound_settings,
         "streamSettings": {}
     }
 
@@ -9538,14 +9575,15 @@ def _add_inbound_to_xray(cfg: dict, ib: dict, iid: str, host: str):
             client_ids.add(str(uuid.uuid4()))
         clients = []
         for uid in client_ids:
-            client = {"id": uid}
             matched_user = next((uu for uu in USERS.values() if uu.get("config_uuid") == uid), {})
             if protocol in ("vless", "reality"):
-                client["flow"] = ""
+                client = {"id": uid, "flow": ""}
             elif protocol == "vmess":
-                client["alterId"] = 0
+                client = {"id": uid, "alterId": 0, "security": "auto"}
             elif protocol == "trojan":
-                client["password"] = str(matched_user.get("trojan_password") or matched_user.get("password") or matched_user.get("config_uuid") or uid)
+                # Trojan authenticates by password. A VLESS/VMess UUID field
+                # is not part of a Trojan client and can make Xray reject it.
+                client = {"password": str(matched_user.get("trojan_password") or matched_user.get("config_uuid") or uid)}
             clients.append(client)
         inbound_obj["settings"]["clients"] = clients
 
@@ -9681,16 +9719,32 @@ def _validate_xray_server_config(config: dict) -> list[str]:
         if key in seen:
             errors.append(f"{ib.get('tag')}: duplicate listener {listen}:{port}")
         seen.add(key)
-        if ib.get("protocol") != "vless":
-            errors.append(f"{ib.get('tag')}: Reality inbound must use VLESS protocol")
-            continue
+        protocol = str(ib.get("protocol") or "")
         clients = ((ib.get("settings") or {}).get("clients") or [])
-        for client in clients:
-            uid = str(client.get("id") or "")
-            try:
-                uuid.UUID(uid)
-            except Exception:
-                errors.append(f"{ib.get('tag')}: invalid VLESS client UUID {uid!r}")
+        if protocol == "vless":
+            for client in clients:
+                uid = str(client.get("id") or "")
+                try:
+                    uuid.UUID(uid)
+                except Exception:
+                    errors.append(f"{ib.get('tag')}: invalid VLESS client UUID {uid!r}")
+        elif protocol == "vmess":
+            for client in clients:
+                uid = str(client.get("id") or "")
+                try:
+                    uuid.UUID(uid)
+                except Exception:
+                    errors.append(f"{ib.get('tag')}: invalid VMess client UUID {uid!r}")
+                if "password" in client:
+                    errors.append(f"{ib.get('tag')}: VMess client must not use Trojan password")
+        elif protocol == "trojan":
+            for client in clients:
+                if not str(client.get("password") or "").strip():
+                    errors.append(f"{ib.get('tag')}: Trojan client password is empty")
+                if "id" in client:
+                    errors.append(f"{ib.get('tag')}: Trojan client must not contain UUID id")
+        else:
+            errors.append(f"{ib.get('tag')}: unsupported native Xray protocol {protocol!r}")
         ss = ib.get("streamSettings") or {}
         if ss.get("security") != "reality":
             errors.append(f"{ib.get('tag')}: security must be reality")
@@ -9884,9 +9938,42 @@ async def gen_xray_keys(_=Depends(require_auth)):
 # SERVER STATS (HTTP polling)
 # ══════════════════════════════════════════════════════════════════════════════
 
+TRAFFIC_HISTORY = deque(maxlen=31 * 24 * 60)
+_LAST_TRAFFIC_SAMPLE = {"ts": 0.0, "bytes": 0}
+
+
+def _record_traffic_sample():
+    now = time.time()
+    total = int(stats.get("total_bytes", 0) or 0)
+    if not TRAFFIC_HISTORY or now - float(TRAFFIC_HISTORY[-1]["ts"]) >= 10:
+        TRAFFIC_HISTORY.append({"ts": now, "bytes": total, "connections": len(connections)})
+
+
+def _traffic_window_seconds(name: str) -> int:
+    return {"hour": 3600, "day": 86400, "week": 7 * 86400, "month": 30 * 86400}.get(name, 86400)
+
+
+@app.get("/api/dashboard/traffic")
+async def dashboard_traffic(range: str = "day", _=Depends(require_auth)):
+    _record_traffic_sample()
+    now = time.time()
+    seconds = _traffic_window_seconds(str(range).lower())
+    rows = [x for x in TRAFFIC_HISTORY if now - float(x["ts"]) <= seconds]
+    if not rows:
+        rows = [{"ts": now, "bytes": int(stats.get("total_bytes", 0) or 0), "connections": len(connections)}]
+    base = rows[0]["bytes"]
+    total = max(0, int(rows[-1]["bytes"]) - int(base))
+    avg_conn = sum(float(x.get("connections", 0)) for x in rows) / max(len(rows), 1)
+    peak_conn = max(int(x.get("connections", 0)) for x in rows)
+    points = []
+    for x in rows[-80:]:
+        points.append({"ts": x["ts"], "bytes": max(0, int(x["bytes"]) - int(base)), "connections": int(x.get("connections", 0))})
+    return {"range": range, "seconds": seconds, "total_bytes": total, "total_fmt": fmt_bytes(total), "average_connections": round(avg_conn, 1), "peak_connections": peak_conn, "current_connections": len(connections), "points": points}
+
 @app.get("/api/server/stats")
 async def server_stats_http(_=Depends(require_auth)):
     """One-shot HTTP response with live server stats (for polling clients)."""
+    _record_traffic_sample()
     return get_live_stats()
 
 
