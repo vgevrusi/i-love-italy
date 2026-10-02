@@ -5560,12 +5560,80 @@ async def get_user_subscription(user_id: str, _=Depends(require_auth)):
 # ── Public sub page ───────────────────────────────────────────────────────────
 @app.get("/p/{uuid_key}", response_class=HTMLResponse)
 async def public_sub_page(uuid_key: str, request: Request):
-    from public_page import get_public_page_html
+    """Pars Space branded public subscription page.
+
+    The page is static and reads its live data from /api/public/sub/{uuid_key}.
+    Keeping the HTML here avoids a fragile optional public_page.py dependency.
+    """
     async with SUBS_LOCK:
-        sub = next(({"sub_id": sid, **s} for sid, s in SUBS.items() if s.get("uuid_key") == uuid_key), None)
+        sub = next((s for s in SUBS.values() if s.get("uuid_key") == uuid_key), None)
     if not sub:
-        return HTMLResponse("<h2 style='font-family:sans-serif;padding:40px'>گروه پیدا نشد</h2>", status_code=404)
-    return HTMLResponse(content=get_public_page_html(uuid_key))
+        return HTMLResponse("<h2 style='font-family:sans-serif;padding:40px'>اشتراک پیدا نشد</h2>", status_code=404)
+    static_sub = _os.path.join(_STATIC_DIR, "sub.html")
+    return FileResponse(static_sub)
+
+# ── Authenticated Linux terminal ────────────────────────────────────────────
+@app.get("/api/terminal/info")
+async def terminal_info(_=Depends(require_auth)):
+    import getpass, platform, shutil
+    return {
+        "ok": True,
+        "enabled": os.environ.get("PARS_TERMINAL_ENABLED", "1").lower() not in ("0", "false", "no"),
+        "shell": "/bin/bash" if Path("/bin/bash").exists() else "/bin/sh",
+        "user": getpass.getuser(),
+        "hostname": platform.node(),
+        "platform": platform.platform(),
+        "cwd": os.getcwd(),
+        "bash": shutil.which("bash") or "",
+    }
+
+@app.post("/api/terminal/exec")
+async def terminal_exec(request: Request, _=Depends(require_auth)):
+    """Run an authenticated Linux shell command as the panel service user.
+
+    This is deliberately an admin-only terminal, not an anonymous remote shell.
+    It never grants sudo/root and caps execution/output so a forgotten command
+    cannot pin the web worker indefinitely.
+    """
+    if os.environ.get("PARS_TERMINAL_ENABLED", "1").lower() in ("0", "false", "no"):
+        raise HTTPException(status_code=403, detail="terminal disabled")
+    body = await request.json()
+    command = str(body.get("command") or "").strip()
+    if not command:
+        raise HTTPException(status_code=400, detail="command is required")
+    if len(command) > 4000:
+        raise HTTPException(status_code=400, detail="command too long")
+    cwd = str(body.get("cwd") or os.getcwd()).strip()
+    if not Path(cwd).is_dir():
+        cwd = os.getcwd()
+    shell = "/bin/bash" if Path("/bin/bash").exists() else "/bin/sh"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            shell, "-lc", command, cwd=cwd,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            raw = await asyncio.wait_for(proc.stdout.read(24000), timeout=30)
+            timed_out = False
+        except asyncio.TimeoutError:
+            timed_out = True
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            raw = await proc.stdout.read(24000)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2)
+        except Exception:
+            pass
+        text_out = raw.decode("utf-8", errors="replace")
+        if len(text_out) > 24000:
+            text_out = text_out[:24000] + "\n… output truncated …"
+        return {"ok": proc.returncode == 0 and not timed_out, "code": proc.returncode, "timed_out": timed_out, "cwd": cwd, "output": text_out}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)[:300])
 
 @app.get("/api/public/sub/{uuid_key}")
 async def public_sub_data(uuid_key: str, request: Request):

@@ -1,0 +1,4 @@
+# Pars Space SNI scanner list
+# Put one hostname per line in data/sni_reality_for_scan.txt
+# Lines beginning with # are ignored.
+example.com

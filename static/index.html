@@ -55,6 +55,8 @@ main{padding:26px 0 60px}.view{display:none;animation:enter .38s cubic-bezier(.2
   <button data-view="inbounds" data-i18n="inbounds">Inbounds</button>
   <button data-view="subs" data-i18n="subs">Subscriptions</button>
   <button data-view="nodes" data-i18n="nodes">Nodes</button>
+  <button data-view="scanner" data-i18n="scanner">Scanner</button>
+  <button data-view="terminal" data-i18n="terminal">Terminal</button>
   <button data-view="activity" data-i18n="activity">Activity</button>
   <button data-view="settings" data-i18n="settings">Settings</button>
  </nav>
@@ -139,6 +141,36 @@ main{padding:26px 0 60px}.view{display:none;animation:enter .38s cubic-bezier(.2
  <div class="card cardPad"><div class="head"><div><h2 data-i18n="nodesTitle">Pars Space Nodes</h2><p data-i18n="nodesDesc">Connect Pars Space panels directly through the private Pars Space API.</p></div><div class="toolbar"><button class="btn" onclick="loadNodes()">↻</button><button class="btn dark" onclick="openNode()" data-i18n="addNode">＋ Add node</button></div></div><div id="nodeList" class="list"></div></div>
 </section>
 
+<section class="view" id="scanner">
+ <div class="cols">
+  <article class="card cardPad">
+   <div class="head"><div><h2 data-i18n="ipScanner">IP Scanner</h2><p data-i18n="ipScannerDesc">TCP latency checker for targets you control or are authorized to test.</p></div><button class="btn" onclick="loadSavedScanner('cf')">Load saved</button></div>
+   <div class="field"><label data-i18n="targets">Targets</label><textarea id="scanTargets" rows="8" dir="ltr" placeholder="1.2.3.4:443
+example.com:443"></textarea></div>
+   <div class="toolbar" style="margin-top:12px"><button class="btn dark" onclick="runIpScan()" data-i18n="scan">Scan</button><button class="btn" onclick="loadSavedScanner('cf')">CF saved</button><button class="btn" onclick="loadSavedScanner('railway')">Railway saved</button><span class="muted" id="ipScanMsg"></span></div>
+   <div id="ipScanResults" class="list" style="margin-top:12px"></div>
+  </article>
+  <article class="card cardPad">
+   <div class="head"><div><h2 data-i18n="sniScanner">SNI Scanner</h2><p data-i18n="sniScannerDesc">Loads the SNI list from data/sni_reality_for_scan.txt and checks TLS handshake latency.</p></div><button class="btn" onclick="loadSniList()">↻</button></div>
+   <div class="toolbar"><span class="pill" id="sniCount">0 SNI</span><button class="btn dark" onclick="runSniScan()" data-i18n="scanSni">Scan list</button><button class="btn" onclick="loadFastestSni()" data-i18n="fastest">Fastest</button><button class="btn" onclick="clearSniResults()" data-i18n="clear">Clear</button></div>
+   <div class="output" id="sniStatus">SNI list not loaded.</div>
+   <div id="sniResults" class="list" style="margin-top:12px"></div>
+  </article>
+ </div>
+ <div class="card cardPad" style="margin-top:14px"><div class="head"><div><h2 data-i18n="sniFile">SNI list file</h2><p data-i18n="sniFileDesc">Put one hostname per line in data/sni_reality_for_scan.txt.</p></div></div><div class="output">mkdir -p data && nano data/sni_reality_for_scan.txt</div><div class="muted" style="margin-top:10px">One SNI per line. Lines beginning with # are ignored.</div></div>
+</section>
+
+<section class="view" id="terminal">
+ <div class="card cardPad">
+  <div class="head"><div><h2 data-i18n="terminalTitle">Linux Terminal</h2><p data-i18n="terminalDesc">Authenticated shell running as the panel service user. No sudo/root escalation.</p></div><span class="pill" id="terminalInfo">checking…</span></div>
+  <div class="field"><label>Command</label><textarea id="terminalCommand" rows="4" dir="ltr" spellcheck="false" placeholder="uname -a
+pwd
+ls -la"></textarea></div>
+  <div class="toolbar" style="margin-top:12px"><button class="btn dark" onclick="runTerminal()" data-i18n="run">Run</button><button class="btn" onclick="clearTerminal()" data-i18n="clear">Clear</button><span class="muted" id="terminalCwd"></span></div>
+  <pre class="output" id="terminalOutput" style="white-space:pre-wrap;word-break:break-word;min-height:260px">Pars Space Linux terminal ready.</pre>
+ </div>
+</section>
+
 <section class="view" id="activity">
  <div class="card cardPad"><div class="head"><div><h2 data-i18n="activityTitle">Activity</h2><p data-i18n="activityDesc">Recent panel events.</p></div><button class="btn" onclick="loadActivity()">↻</button></div><div id="activityList" class="list"></div></div>
 </section>
@@ -174,14 +206,14 @@ main{padding:26px 0 60px}.view{display:none;animation:enter .38s cubic-bezier(.2
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 let lang=localStorage.getItem('ps_lang')||'fa', theme=localStorage.getItem('ps_theme')||'system';
 const T={
-fa:{overview:'نمای کلی',clients:'کاربر و کانفیگ',inbounds:'اینباندها',subs:'اشتراک‌ها',nodes:'نودها',activity:'فعالیت',settings:'تنظیمات',
+fa:{overview:'نمای کلی',clients:'کاربر و کانفیگ',inbounds:'اینباندها',subs:'اشتراک‌ها',nodes:'نودها',scanner:'اسکنر',terminal:'ترمینال',activity:'فعالیت',settings:'تنظیمات',ipScanner:'اسکنر IP',ipScannerDesc:'بررسی TCP برای مقصدهایی که مجاز به تست آن‌ها هستید.',sniScanner:'اسکنر SNI',sniScannerDesc:'لیست SNI را از فایل پنل می‌خواند و زمان Handshake را بررسی می‌کند.',targets:'مقصدها',scan:'اسکن',scanSni:'اسکن لیست',fastest:'سریع‌ترین',sniFile:'فایل SNI',sniFileDesc:'هر hostname در یک خط از data/sni_reality_for_scan.txt',terminalTitle:'ترمینال لینوکس',terminalDesc:'شل احراز هویت‌شده با کاربر سرویس پنل، بدون sudo/root.',run:'اجرا',
 heroTitle:'همه‌چیز،<br>تحت کنترل.',operational:'همه سیستم‌ها فعال هستند',traffic:'ترافیک فعلی',liveData:'داده زنده از پنل',activeUsers:'کاربران فعال',connections:'اتصالات',subscriptions:'اشتراک‌ها',
 trafficOverview:'نمای ترافیک',last7:'وضعیت زنده پنل',quickActions:'دسترسی سریع',commonOps:'عملیات پرکاربرد',addUser:'＋ افزودن کاربر',createConfig:'ساخت کانفیگ',addInbound:'＋ افزودن اینباند',newSub:'＋ اشتراک جدید',subDesc:'لینک اختصاصی پنل',preferences:'⚙ تنظیمات',themeLang:'تم و زبان',
 usersConfig:'کاربر و Config Builder',usersConfigDesc:'ساخت کاربر و کانفیگ در یک فرآیند واحد.',username:'نام کاربری',password:'رمز عبور',protocol:'پروتکل',inbound:'اینباند',trafficLimit:'محدودیت ترافیک (GB)',expireDays:'مدت اعتبار (روز)',server:'سرور',sni:'SNI',path:'Path',createUserConfig:'ساخت کاربر + کانفیگ',clear:'پاک کردن',clientList:'لیست کاربران',clientListDesc:'کاربران واقعی از /api/users',
 inboundTitle:'مدیریت اینباند',inboundDesc:'ساخت و مدیریت Listenerهای واقعی پنل',subTitle:'Pars Subscription',subTitleDesc:'گروه اشتراک واقعی با endpoint /sub-group',nodesTitle:'نودهای Pars Space',nodesDesc:'اتصال مستقیم پنل‌های Pars Space با API اختصاصی',activityTitle:'فعالیت',activityDesc:'رویدادهای اخیر پنل',addNode:'＋ افزودن نود',connectNode:'اتصال پنل Pars Space',connectNodeDesc:'آدرس HTTPS و کلید API پنل مقصد را وارد کنید.',nodeName:'نام نود',nodeUrl:'آدرس پنل',connect:'اتصال',parsApi:'Pars Space API',parsApiDesc:'کلید API پنل برای اتصال نود مقصد.',regenerate:'ساخت کلید جدید',copyKey:'کپی API Key',apiPrefix:'پیشوند: psp_',
 appearance:'ظاهر',appearanceDesc:'تنظیمات ظاهری روی همین دستگاه ذخیره می‌شود.',theme:'تم',language:'زبان',account:'حساب Administrator',accountDesc:'تغییر رمز عبور از endpoint واقعی پنل انجام می‌شود.',newUsername:'نام کاربری جدید',currentPassword:'رمز فعلی',newPassword:'رمز جدید',save:'ذخیره تغییرات',
 createInbound:'ساخت اینباند',createInboundDesc:'فقط تنظیمات مربوط به پروتکل انتخاب‌شده نمایش داده می‌شود.',protocolSettings:'تنظیمات پروتکل',protocolSettingsDesc:'اگر Inbound روی Auto / dedicated باشد، این تنظیمات برای ساخت Inbound استفاده می‌شوند.',name:'نام',network:'Network',security:'Security',port:'Port',externalPort:'External Port',domain:'Domain',wsPath:'WS Path',create:'ساخت',cancel:'لغو',noData:'داده‌ای وجود ندارد',copy:'کپی',delete:'حذف',online:'فعال'},
-en:{overview:'Overview',clients:'Users & Config',inbounds:'Inbounds',subs:'Subscriptions',nodes:'Nodes',activity:'Activity',settings:'Settings',
+en:{overview:'Overview',clients:'Users & Config',inbounds:'Inbounds',subs:'Subscriptions',nodes:'Nodes',scanner:'Scanner',terminal:'Terminal',activity:'Activity',settings:'Settings',ipScanner:'IP Scanner',ipScannerDesc:'TCP latency checker for authorized targets.',sniScanner:'SNI Scanner',sniScannerDesc:'Check TLS handshake latency for your SNI list.',targets:'Targets',scan:'Scan',scanSni:'Scan list',fastest:'Fastest',sniFile:'SNI list file',sniFileDesc:'One hostname per line in data/sni_reality_for_scan.txt.',terminalTitle:'Linux Terminal',terminalDesc:'Authenticated shell as the panel service user. No sudo/root escalation.',run:'Run',
 heroTitle:'Everything,<br>under control.',operational:'All systems operational',traffic:'Current traffic',liveData:'Live data from panel',activeUsers:'Active users',connections:'Connections',subscriptions:'Subscriptions',
 trafficOverview:'Traffic overview',last7:'Live panel snapshot',quickActions:'Quick actions',commonOps:'Common operations',addUser:'＋ Add user',createConfig:'Create config',addInbound:'＋ Add inbound',newSub:'＋ New subscription',subDesc:'Custom panel link',preferences:'⚙ Preferences',themeLang:'Theme & language',
 usersConfig:'Users & Config Builder',usersConfigDesc:'User creation and config generation are one workflow.',username:'Username',password:'Password',protocol:'Protocol',inbound:'Inbound',trafficLimit:'Traffic limit (GB)',expireDays:'Expire days',server:'Server',sni:'SNI',path:'Path',createUserConfig:'Create user + config',clear:'Clear',clientList:'Client list',clientListDesc:'Real users from /api/users',
@@ -196,7 +228,7 @@ function setLang(x){lang=x;localStorage.setItem('ps_lang',x);applyI18n();toast(x
 function setTheme(x){theme=x;localStorage.setItem('ps_theme',x);applyTheme();toast('Theme updated')}
 $('#langBtn').onclick=()=>setLang(lang==='fa'?'en':'fa');$('#themeBtn').onclick=()=>setTheme(theme==='dark'?'light':'dark');$('#langSelect').onchange=e=>setLang(e.target.value);$('#themeSelect').onchange=e=>setTheme(e.target.value);
 $$('.nav button').forEach(b=>b.onclick=()=>go(b.dataset.view));
-function go(id){$$('.view').forEach(v=>v.classList.remove('active'));$('#'+id).classList.add('active');$$('.nav button').forEach(b=>b.classList.toggle('active',b.dataset.view===id));window.scrollTo({top:0,behavior:'smooth'});if(id==='clients')loadClients();if(id==='inbounds')loadInbounds();if(id==='subs')loadSubs();if(id==='nodes')loadNodes();if(id==='activity')loadActivity()}
+function go(id){$$('.view').forEach(v=>v.classList.remove('active'));$('#'+id).classList.add('active');$$('.nav button').forEach(b=>b.classList.toggle('active',b.dataset.view===id));window.scrollTo({top:0,behavior:'smooth'});if(id==='clients')loadClients();if(id==='inbounds')loadInbounds();if(id==='subs')loadSubs();if(id==='nodes')loadNodes();if(id==='scanner'){loadSniList();loadSniResults()}if(id==='terminal')loadTerminalInfo();if(id==='activity')loadActivity()}
 let timer;function toast(m){let e=$('#toast');e.textContent=m;e.classList.add('show');clearTimeout(timer);timer=setTimeout(()=>e.classList.remove('show'),1900)}
 async function api(url,opt={}){let r=await fetch(url,{credentials:'same-origin',...opt,headers:{'Content-Type':'application/json',...(opt.headers||{})}});if(r.status===401){location.href='/login';throw Error('AUTH')}let txt=await r.text();let data;try{data=JSON.parse(txt)}catch{data=txt}if(!r.ok)throw Error(data?.detail||data?.message||txt||('HTTP '+r.status));return data}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
@@ -309,6 +341,17 @@ async function createSubscription(){
  }catch(e){toast(e.message)}
 }
 
+async function loadSavedScanner(type){try{let d=await api('/api/scanner/ips/'+encodeURIComponent(type));$('#scanTargets').value=(d.ips||[]).join('\n');$('#ipScanMsg').textContent=(d.ips||[]).length+' saved';}catch(e){toast(e.message)}}
+async function runIpScan(){try{let raw=$('#scanTargets').value.split(/[\s,]+/).map(x=>x.trim()).filter(Boolean).slice(0,150);if(!raw.length)throw Error('Enter at least one IP or host:port');$('#ipScanMsg').textContent='Scanning…';let d=await api('/api/scanner/ping-batch',{method:'POST',body:JSON.stringify({targets:raw,timeout:2})});let r=d.results||[];$('#ipScanResults').innerHTML=r.map(x=>`<div class="row"><span dir="ltr"><b>${esc(x.target)}</b></span><span class="pill">${x.ok?esc(x.latency_ms+' ms'):'offline'}</span></div>`).join('')||'<div class="empty">No results</div>';let good=r.filter(x=>x.ok).map(x=>x.target);if(good.length)await api('/api/scanner/save',{method:'POST',body:JSON.stringify({type:'cf',ips:good,replace:false,seq:(await api('/api/scanner/ips/cf')).seq||0})});$('#ipScanMsg').textContent=`${r.filter(x=>x.ok).length}/${r.length} reachable`; }catch(e){$('#ipScanMsg').textContent=e.message;toast(e.message)}}
+async function loadSniList(){try{let d=await api('/api/scanner/sni-scan-list');$('#sniCount').textContent=(d.count||0)+' SNI';$('#sniStatus').textContent=(d.snis||[]).slice(0,5).join('\n')+(d.count>5?'\n…':'');}catch(e){toast(e.message)}}
+async function loadSniResults(){try{let d=await api('/api/scanner/sni-results');renderSniResults(d.results||[])}catch(e){toast(e.message)}}
+function renderSniResults(a){$('#sniResults').innerHTML=a.length?a.map((x,i)=>`<div class="row"><span dir="ltr"><b>#${i+1} ${esc(x.sni)}</b></span><span class="pill">${esc(x.latency_ms)} ms</span></div>`).join(''):'<div class="empty">No saved SNI results</div>'}
+async function runSniScan(){try{let d=await api('/api/scanner/sni-scan-list');let snis=(d.snis||[]).slice(0,120);if(!snis.length)throw Error('SNI list is empty');$('#sniStatus').textContent='Scanning '+snis.length+' hosts…';let out=[];for(let i=0;i<snis.length;i+=10){let batch=snis.slice(i,i+10);let rs=await Promise.all(batch.map(async s=>{try{return await api('/api/scanner/sni-check?host='+encodeURIComponent(s)+'&port=443')}catch{return {ok:false,sni:s}}}));out.push(...rs);$('#sniStatus').textContent=`${Math.min(i+10,snis.length)}/${snis.length}`;}let good=out.filter(x=>x.ok).sort((a,b)=>a.latency_ms-b.latency_ms).slice(0,10).map(x=>({sni:x.sni,latency_ms:x.latency_ms}));renderSniResults(good);if(good.length)await api('/api/scanner/sni-save-results',{method:'POST',body:JSON.stringify({results:good,top:10})});$('#sniStatus').textContent=good.length+' reachable SNI saved';}catch(e){$('#sniStatus').textContent=e.message;toast(e.message)}}
+async function clearSniResults(){try{await api('/api/scanner/sni-clear-results',{method:'POST'});renderSniResults([]);toast('SNI results cleared')}catch(e){toast(e.message)}}
+async function loadFastestSni(){try{let d=await api('/api/scanner/sni-fastest');if(!d.ok)throw Error('No SNI result');$('#sniStatus').textContent=d.sni+' · '+d.latency_ms+' ms';await copyText(d.sni)}catch(e){toast(e.message)}}
+async function loadTerminalInfo(){try{let d=await api('/api/terminal/info');$('#terminalInfo').textContent=d.enabled?(d.user+' · '+d.shell):'disabled';$('#terminalCwd').textContent=d.cwd||''}catch(e){$('#terminalInfo').textContent='error'}}
+async function runTerminal(){try{let command=$('#terminalCommand').value.trim();if(!command)return;$('#terminalOutput').textContent='Running…';let d=await api('/api/terminal/exec',{method:'POST',body:JSON.stringify({command,cwd:$('#terminalCwd').textContent||undefined})});$('#terminalOutput').textContent=(d.output||'')+`\n\n[exit ${d.code??'?'}${d.timed_out?' · timeout':''}]`; }catch(e){$('#terminalOutput').textContent=e.message}}
+function clearTerminal(){$('#terminalCommand').value='';$('#terminalOutput').textContent='Pars Space Linux terminal ready.'}
 async function loadNodes(){try{let d=await api('/api/nodes');let a=d.nodes||[];$('#nodeList').innerHTML=a.length?a.map(n=>`<div class="row"><div><b>${esc(n.name||n.node_id)}</b><div class="muted" dir="ltr">${esc(n.url||'')}</div></div><div class="toolbar"><span class="pill">${esc(n.status||'unknown')}</span><button class="btn small" onclick="pingNode('${esc(n.node_id)}')">Ping</button><button class="btn small" onclick="syncNode('${esc(n.node_id)}')">Sync</button><button class="btn small danger" onclick="deleteNode('${esc(n.node_id)}')">${tr('delete')}</button></div></div>`).join(''):`<div class="empty">${tr('noData')}</div>`}catch(e){$('#nodeList').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}
 function openNode(){$('#nodeModal').classList.add('open')}
 function closeNode(){$('#nodeModal').classList.remove('open')}
