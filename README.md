@@ -1,6 +1,6 @@
 # Pars Space — Railway deployment bundle
 
-This bundle is based on the real SpiderPanel backend and its API-connected dashboard, with Pars Space branding. The live `/spider` route serves `static/index.html` (the functional UI); `preview/dashboard-review.html` is only a separate visual prototype and is **not** the production dashboard.
+This bundle is based on the real SpiderPanel backend and its API-connected dashboard, with Pars Space branding. The live `/dashboard` route serves `static/index.html`; `/spider` is a compatibility redirect to `/dashboard` (the functional UI); `preview/dashboard-review.html` is only a separate visual prototype and is **not** the production dashboard.
 
 ## Before deploying
 
@@ -20,7 +20,7 @@ Add a Railway Volume mounted at `/data`. The application stores its JSON state a
 1. Upload/push the contents of this folder to a **new Pars Space repository** on GitHub. Do not overwrite the upstream SpiderPanel repository.
 2. Create a Railway service from that repository. The included `railway.json` selects the included Dockerfile.
 3. Add the Variables above and mount a Volume at `/data`.
-4. Generate a Railway domain and open it. `/` redirects to `/login`; after successful login the panel opens at `/spider`.
+4. Generate a Railway domain and open it. `/` redirects to `/login`; after successful login the panel opens at `/dashboard`.
 5. Check `/healthz`, login/logout, inbound CRUD, user CRUD, subscriptions, backup/restore, and any integrations you rely on before migrating production traffic.
 
 ## What is included
